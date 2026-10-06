@@ -1,11 +1,7 @@
-"""Local-only web server for the RDP troubleshooter.
+"""Local-only web server for the Network Stability Monitor.
 
-Security posture:
-- Binds 127.0.0.1 only; never exposed to the network.
-- Every request must carry a random per-run token (blocks other local
-  websites from poking this server via your browser).
-- Host header is pinned to localhost, and all input is validated.
-- Nothing is logged except startup errors; no credentials are ever asked for.
+Same security posture as the RDP troubleshooter: 127.0.0.1 only,
+random per-run token, pinned Host header, validated input only.
 """
 from __future__ import annotations
 
@@ -14,23 +10,20 @@ import secrets
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
-from .diagnostics import RDP_PORT, run_diagnosis
-from .network_utils import (local_ipv4, parse_port, parse_target,
-                            validate_scan_cidr)
-from .scanner import detect_network, scan_network
+from .monitor import MonitorService
+from .prober import http_check, parse_url, run_speed_test
 from .web_ui import PAGE
 
 MAX_BODY = 16_384
-_scan_lock = threading.Lock()
+_speed_lock = threading.Lock()
 
 
-def make_handler(token: str):
+def make_handler(token: str, service: MonitorService):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "RdpTroubleshooter/1.0"
+        server_version = "NetworkMonitor/1.0"
 
-        # --- helpers -----------------------------------------------------
         def _allowed(self) -> bool:
             host = (self.headers.get("Host") or "").split(":")[0].lower()
             if host not in ("127.0.0.1", "localhost"):
@@ -42,7 +35,6 @@ def make_handler(token: str):
             return True
 
         def _is_page_load(self) -> bool:
-            # The initial page load carries the token in the URL instead.
             if self.path == "/" or self.path.startswith("/?"):
                 query = parse_qs(urlparse(self.path).query)
                 return secrets.compare_digest((query.get("token") or [""])[0], token)
@@ -63,26 +55,29 @@ def make_handler(token: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, fmt, *args):  # keep the console clean
+        def log_message(self, fmt, *args):
             pass
 
-        # --- routes ------------------------------------------------------
         def do_GET(self):
             path = urlparse(self.path).path
             if path == "/":
                 if not self._allowed():
                     return
                 self._send(200, PAGE, "text/html; charset=utf-8")
-            elif path == "/api/local-info":
+            elif path == "/api/status":
                 if not self._allowed():
                     return
-                self._send(200, detect_network())
+                self._send(200, service.status())
+            elif path == "/api/export.csv":
+                if not self._allowed():
+                    return
+                self._send(200, service.export_csv(), "text/csv; charset=utf-8")
             else:
                 self._send(404, {"error": "Not found."})
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path not in ("/api/scan", "/api/diagnose"):
+            if path not in ("/api/target", "/api/http-check", "/api/speedtest"):
                 self._send(404, {"error": "Not found."})
                 return
             if not self._allowed():
@@ -102,72 +97,48 @@ def make_handler(token: str):
             if not isinstance(data, dict):
                 self._send(400, {"error": "Request must be a JSON object."})
                 return
-            if path == "/api/scan":
-                self._handle_scan(data)
-            else:
-                self._handle_diagnose(data)
-
-        def _handle_scan(self, data: dict):
-            raw = data.get("cidr")
-            if raw:
+            if path == "/api/target":
                 try:
-                    network = validate_scan_cidr(raw)
+                    parsed = parse_url(data.get("url", ""))
                 except ValueError as exc:
                     self._send(400, {"error": str(exc)})
                     return
-            else:
-                info = detect_network()
-                if not info["subnet"]:
-                    self._send(400, {"error": "Could not detect your local network. Connect to Wi-Fi/Ethernet and try again."})
-                    return
+                self._send(200, {"target": service.add_custom_target(parsed)})
+            elif path == "/api/http-check":
                 try:
-                    network = validate_scan_cidr(info["subnet"])
+                    parsed = parse_url(data.get("url", ""))
                 except ValueError as exc:
                     self._send(400, {"error": str(exc)})
                     return
-            if not _scan_lock.acquire(blocking=False):
-                self._send(409, {"error": "A scan is already running. Wait for it to finish."})
-                return
-            try:
-                devices = scan_network(network)
-            finally:
-                _scan_lock.release()
-            self._send(200, {"network": str(network), "devices": devices})
-
-        def _handle_diagnose(self, data: dict):
-            try:
-                target = parse_target(data.get("target", ""))
-                port = parse_port(data.get("port", RDP_PORT), RDP_PORT)
-            except ValueError as exc:
-                self._send(400, {"error": str(exc)})
-                return
-            scenario = data.get("scenario", "lan")
-            if scenario not in ("lan", "vpn", "internet"):
-                scenario = "lan"
-            symptom = data.get("symptom", "generic")
-            if symptom not in ("generic", "not_found", "timeout", "refused",
-                               "login_rejected", "black_screen"):
-                symptom = "generic"
-            result = run_diagnosis(target, port=port, scenario=scenario,
-                                   symptom=symptom, local_ip=local_ipv4())
-            self._send(200, {"result": result.to_dict()})
+                self._send(200, {"result": http_check(parsed)})
+            else:  # /api/speedtest
+                if not _speed_lock.acquire(blocking=False):
+                    self._send(409, {"error": "A speed test is already running. Wait for it to finish."})
+                    return
+                try:
+                    result = run_speed_test()
+                finally:
+                    _speed_lock.release()
+                self._send(200, {"result": result})
 
     return Handler
 
 
-def build_server():
+def build_server(service: MonitorService | None = None):
     """Create (server, token, url) without starting it. The hub uses
-    this to run the troubleshooter alongside the other tools."""
+    this to run the monitor alongside the other tools in one process."""
     token = secrets.token_urlsafe(24)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(token))
-    port = server.server_address[1]
-    url = f"http://127.0.0.1:{port}/?token={token}"
+    if service is None:
+        service = MonitorService()
+    service.start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(token, service))
+    url = f"http://127.0.0.1:{server.server_address[1]}/?token={token}"
     return server, token, url
 
 
 def serve(open_browser: bool = True) -> None:
-    server, token, url = build_server()
-    print(f"RDP Troubleshooter running at {url}", flush=True)
+    server, _token, url = build_server()
+    print(f"Network Stability Monitor running at {url}", flush=True)
     print("Press Ctrl+C to stop. (Local only: nothing is reachable from your network.)", flush=True)
     if open_browser:
         webbrowser.open(url)

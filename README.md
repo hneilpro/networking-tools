@@ -9,9 +9,17 @@ no accounts, no cloud, nothing uploaded anywhere.
 | Tool | What it does |
 | --- | --- |
 | **Remote Desktop Troubleshooter** (`run_rdp_troubleshooter.py`) | Works out whether a **firewall**, the **router/network**, or the **target PC itself** is blocking a Windows Remote Desktop (RDP) connection, and gives the fix steps in order. |
+| **Network Stability Monitor** (`run_network_monitor.py`) | Graphs **ping, jitter, and packet loss** to your router and the internet over time, so you can see whether a slowdown is inside your home or outside it. Optional per-URL connection check and on-demand speed test. |
 
-More tools will live alongside it in this repo; each gets its own launcher
-script and its own section below.
+Run everything from one homepage menu instead:
+
+```bash
+python run_networking_tools.py
+```
+
+Each tool starts only when you pick it from the menu, and everything runs
+inside that one program. Each tool also still works on its own with its
+own launcher script.
 
 ---
 
@@ -45,6 +53,60 @@ The tool refuses to scan anything except private (home/office) networks of
 254 addresses or fewer, and only scans when you click the button.
 
 ---
+
+---
+
+## Network Stability Monitor
+
+Your connection feels fine one minute and terrible the next. This tool
+watches it continuously and graphs what is actually happening:
+
+- **Ping (latency)** to your gateway/router and to two internet targets
+  (Cloudflare 1.1.1.1, Google 8.8.8.8), sampled about once a second.
+- **Jitter** — how much the ping bounces around. Steady 40 ms beats
+  bouncing between 10 ms and 120 ms; jitter is what makes calls and
+  games feel broken.
+- **Packet loss** — the share of probes that never came back. Even
+  1–3% loss degrades calls and gaming badly.
+- Per-target **median and p95** ping (averages hide spikes), current /
+  min / max, and a plain-language verdict: stable, degraded, unstable,
+  or down.
+- An **outage log**: when a target failed three probes in a row, when
+  it came back, and how long it was out.
+- **Router vs internet separation**: if the gateway line stays clean
+  while the internet lines spike, the fault is outside your home.
+
+Optional checks:
+
+- **Test a specific site or URL**: paste a URL (or host) and either add
+  it as a continuously monitored target on the same graph, or run a
+  one-shot connection breakdown — DNS time, TCP connect, TLS handshake,
+  time to first byte, total time, and HTTP status.
+- **Run speed test**: on-demand download/upload (via Cloudflare's public
+  speed endpoints). It saturates your link for a few seconds, so the
+  live graph spikes while it runs — that is the test, not an outage.
+- **Download CSV**: exports the whole session history so you have a
+  record of a dropout, e.g. for an ISP support call.
+
+Run it:
+
+```bash
+python run_network_monitor.py
+```
+
+Limitations to know:
+
+- Ping uses your OS `ping` command; if a target blocks ping, the tool
+  measures TCP connect time instead and says so. Blocked ping alone
+  never counts as "down".
+- Sample cadence is about one second per target, but a failing target
+  takes longer to time out, so the real interval stretches when things
+  are already broken. Timestamps in the CSV are exact.
+- The speed test is a single connection over plain HTTP, so very fast
+  lines may read low. Treat it as "is it roughly right", not a
+  benchmark record.
+- History lives in memory (about an hour of samples) plus the CSV
+  export. Nothing is uploaded anywhere.
 
 ## Setup (one time)
 
@@ -106,7 +168,9 @@ yours and is never committed.
 With the environment active (or even without — there are no dependencies):
 
 ```bash
-python run_rdp_troubleshooter.py
+python run_networking_tools.py      # homepage menu with every tool
+python run_rdp_troubleshooter.py    # or: just the RDP tool
+python run_network_monitor.py       # or: just the stability monitor
 ```
 
 Your browser opens a local page (address looks like
@@ -159,14 +223,25 @@ python -m pytest
 ## Repo layout
 
 ```
+run_networking_tools.py       # all-in-one launcher: homepage menu, tools start on pick
 run_rdp_troubleshooter.py     # launcher for the RDP troubleshooter
+run_network_monitor.py        # launcher for the stability monitor
+networking_hub/
+    app.py                    # hub server + lazy in-process tool launcher
+    web_ui.py                 # the homepage menu
 rdp_troubleshooter/
     app.py                    # local web server (127.0.0.1, token-guarded)
     web_ui.py                 # the single browser page (self-contained, no external assets)
     diagnostics.py            # check sequence + verdict engine
     scanner.py                # local network device discovery
     network_utils.py          # input validation, subnet math
-tests/                        # pytest suite (verdict logic, validation, HTTP layer)
+network_monitor/
+    app.py                    # local web server (127.0.0.1, token-guarded)
+    web_ui.py                 # live graph page (self-contained, no external assets)
+    monitor.py                # continuous sampler, ring buffer, outage log
+    prober.py                 # ping/TCP probes, HTTP breakdown, speed test
+    metrics.py                # median/p95/jitter/loss stats + stability verdict
+tests/                        # pytest suite (verdict logic, metrics, validation, HTTP layer)
 ```
 
 ## License
