@@ -7,3 +7,6 @@ __pycache__/
 .vscode/
 .DS_Store
 *.log
+# Local user settings (expected plan speeds). Personal, per-PC data
+# written by the app itself; never committed.
+network_monitor/local_data/

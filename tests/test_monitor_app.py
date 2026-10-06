@@ -169,6 +169,27 @@ def test_monitor_session_flow(monitor_server):
     assert json.loads(body)["session"]["state"] == "cancelled"
 
 
+def test_monitor_expected_speeds_roundtrip(monitor_server, monkeypatch, tmp_path):
+    from network_monitor import local_settings
+    monkeypatch.setattr(local_settings, "LOCAL_DATA_DIR", tmp_path)
+    srv, token, _ = monitor_server
+    status, body, _ = _call(srv, "GET", "/api/expected-speeds", token=token)
+    assert status == 200
+    assert json.loads(body)["expected"] == {"download_mbps": None, "upload_mbps": None}
+    status, body, _ = _call(srv, "POST", "/api/expected-speeds", token=token,
+                            body={"download_mbps": 500, "upload_mbps": 50})
+    assert status == 200
+    assert json.loads(body)["expected"] == {"download_mbps": 500.0, "upload_mbps": 50.0}
+    status, body, _ = _call(srv, "GET", "/api/expected-speeds", token=token)
+    assert json.loads(body)["expected"]["download_mbps"] == 500.0
+    # Bad values are a 400, and the saved good values survive it.
+    status, _, _ = _call(srv, "POST", "/api/expected-speeds", token=token,
+                         body={"download_mbps": -1})
+    assert status == 400
+    status, body, _ = _call(srv, "GET", "/api/expected-speeds", token=token)
+    assert json.loads(body)["expected"]["download_mbps"] == 500.0
+
+
 def test_monitor_session_bad_duration(monitor_server):
     srv, token, _ = monitor_server
     for bad in ({"duration_min": 0}, {"duration_min": 999}, {}, {"duration_min": "soon"}):

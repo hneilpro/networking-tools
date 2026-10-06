@@ -120,6 +120,14 @@ class _FakeResp:
         return False
 
 
+def test_speed_test_defaults_are_sustained():
+    # Short bursts mostly measure TCP slow-start. The defaults must be
+    # long, settled phases (research: 20-30s class, warmup discarded).
+    assert prober.SPEED_DOWNLOAD_SECONDS >= 20
+    assert prober.SPEED_UPLOAD_SECONDS >= 15
+    assert prober.SPEED_WARMUP_SECONDS >= 1
+
+
 def test_speed_test_timed_with_fakes():
     calls = {"n": 0}
     lock = threading.Lock()
@@ -149,3 +157,7 @@ def test_speed_test_timed_with_fakes():
     assert result["loaded_latency_ms"] == 30.0
     assert result["bufferbloat_ms"] == 20.0
     assert result["bufferbloat_grade"] == "B"
+    # Warmup is discarded from the headline's measured window.
+    assert result["warmup_seconds"] >= 0
+    assert result["download_measured_seconds"] < result["download_seconds"]
+    assert isinstance(result["cap_hit"], bool)  # instant fakes can hit the cap

@@ -23,12 +23,15 @@ from rdp_troubleshooter.network_utils import parse_target
 
 _PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 MAX_URL_LEN = 2048
-SPEED_DOWNLOAD_SECONDS = 10.0
-SPEED_UPLOAD_SECONDS = 8.0
+SPEED_DOWNLOAD_SECONDS = 25.0
+SPEED_UPLOAD_SECONDS = 20.0
+# The first moments of any transfer are TCP slow-start ramping, not the
+# line's real speed; that warmup is discarded from the headline number.
+SPEED_WARMUP_SECONDS = 2.0
 SPEED_DOWNLOAD_CHUNK_BYTES = 10_000_000
 SPEED_UPLOAD_CHUNK_BYTES = 262_144  # small chunks: a timed phase can only
 # overshoot its deadline by one in-flight chunk per stream
-SPEED_MAX_TOTAL_BYTES = 600_000_000  # safety cap across one whole test
+SPEED_MAX_TOTAL_BYTES = 2_000_000_000  # safety cap per phase
 SPEED_PARALLEL_STREAMS = 4
 USER_AGENT = "networking-tools-monitor/1.0"
 
@@ -291,13 +294,26 @@ def _median_or_none(values: list[float]) -> float | None:
     return round(statistics.median(values), 2) if values else None
 
 
-def _timed_phase(duration_s: float, do_once, parallel: int) -> tuple[int, float, str | None]:
+def _timed_phase(duration_s: float, do_once, parallel: int,
+                 warmup_s: float = SPEED_WARMUP_SECONDS) -> dict:
     """Run do_once(deadline) in `parallel` workers until the deadline.
-    Returns (total_bytes, elapsed_s, first_error). A single shared byte
-    cap keeps a fast line from turning the test into a data binge."""
+
+    Returns a dict with:
+      counted_bytes   bytes after the warmup window (headline throughput)
+      total_bytes     every byte moved, warmup included (data used)
+      elapsed_s       wall time the phase actually ran
+      measured_s      elapsed minus warmup (the headline's denominator)
+      cap_hit         True if the shared safety cap stopped the phase
+      error           first worker error, if any
+
+    Short test phases scale the warmup down so a 0.25s unit-test phase
+    is not discarded whole. A single shared byte cap keeps a fast line
+    from turning the test into a data binge."""
+    duration_s = max(0.05, float(duration_s))
+    warmup_s = max(0.0, min(float(warmup_s), duration_s * 0.4))
     start = time.monotonic()
     deadline = start + duration_s
-    state = {"total": 0}
+    state = {"counted": 0, "total": 0}
     lock = threading.Lock()
     errors: list[str] = []
 
@@ -315,8 +331,11 @@ def _timed_phase(duration_s: float, do_once, parallel: int) -> tuple[int, float,
                 return
             if not n:
                 return
+            finished_at = time.monotonic()
             with lock:
                 state["total"] += n
+                if finished_at - start >= warmup_s:
+                    state["counted"] += n
 
     threads = [threading.Thread(target=worker, daemon=True)
                for _ in range(max(1, parallel))]
@@ -324,20 +343,39 @@ def _timed_phase(duration_s: float, do_once, parallel: int) -> tuple[int, float,
         thread.start()
     for thread in threads:
         thread.join(timeout=duration_s + 20)
-    return state["total"], time.monotonic() - start, (errors[0] if errors else None)
+    elapsed = time.monotonic() - start
+    counted = state["counted"]
+    measured = max(0.0, elapsed - warmup_s)
+    if counted == 0 and state["total"] > 0:
+        # The phase ended before the warmup did (e.g. the safety cap on
+        # an extremely fast line): fall back to the whole phase rather
+        # than reporting no measurement at all.
+        counted = state["total"]
+        measured = elapsed
+    return {
+        "counted_bytes": counted,
+        "total_bytes": state["total"],
+        "elapsed_s": elapsed,
+        "measured_s": measured,
+        "warmup_s": warmup_s,
+        "cap_hit": state["total"] >= SPEED_MAX_TOTAL_BYTES,
+        "error": errors[0] if errors else None,
+    }
 
 
 def run_speed_test(download_s: float = SPEED_DOWNLOAD_SECONDS,
                    upload_s: float = SPEED_UPLOAD_SECONDS,
                    parallel: int = SPEED_PARALLEL_STREAMS,
-                   probe_fn=None, urlopen_fn=None) -> dict:
+                   probe_fn=None, urlopen_fn=None,
+                   warmup_s: float = SPEED_WARMUP_SECONDS) -> dict:
     """Sustained, time-boxed throughput via Cloudflare's public speed
-    endpoints. Timed phases (default ~10s down, ~8s up) instead of one
-    small fixed-size burst, so the connection gets past its slow start
-    and the number reflects the line, not the ramp. While the download
-    saturates the link, latency probes keep running so the result also
-    carries a bufferbloat (latency-under-load) grade. Sits outside the
-    monitor loop on purpose. probe_fn/urlopen_fn are injectable for tests."""
+    endpoints. Long timed phases (default 25s down, 20s up) with the
+    first ~2s of slow-start discarded from the headline number, so the
+    result reflects the line settled at speed, not its ramp. While the
+    download saturates the link, latency probes keep running so the
+    result also carries a bufferbloat (latency-under-load) grade.
+    Sits outside the monitor loop on purpose. probe_fn/urlopen_fn are
+    injectable for tests."""
     probe_fn = probe_fn or probe_target
     urlopen_fn = urlopen_fn or urllib.request.urlopen
     download_s = max(0.05, min(float(download_s), 60.0))
@@ -380,23 +418,28 @@ def run_speed_test(download_s: float = SPEED_DOWNLOAD_SECONDS,
     prober_thread = threading.Thread(target=loaded_prober, daemon=True)
     prober_thread.start()
     try:
-        got, down_seconds, down_error = _timed_phase(download_s, download_once, parallel)
+        down = _timed_phase(download_s, download_once, parallel, warmup_s=warmup_s)
     finally:
         loaded_stop.set()
         prober_thread.join(timeout=5)
+    got = down["counted_bytes"]
+    down_seconds = down["elapsed_s"]
     out["download_seconds"] = round(down_seconds, 2)
+    out["download_measured_seconds"] = round(down["measured_s"], 2)
+    out["warmup_seconds"] = round(down["warmup_s"], 2)
+    out["cap_hit"] = down["cap_hit"]
     out["loaded_latency_ms"] = _median_or_none(loaded_values)
     if out["idle_latency_ms"] is not None and out["loaded_latency_ms"] is not None:
         out["bufferbloat_ms"] = round(out["loaded_latency_ms"] - out["idle_latency_ms"], 2)
     else:
         out["bufferbloat_ms"] = None
     out["bufferbloat_grade"] = bufferbloat_grade(out["bufferbloat_ms"])
-    if got == 0 or down_seconds <= 0:
-        out["error"] = f"Download test failed: {down_error}." if down_error \
+    if got == 0 or down["measured_s"] <= 0:
+        out["error"] = f"Download test failed: {down['error']}." if down["error"] \
             else "Download test got no data."
         return out
-    out["download_mbps"] = round(got * 8 / down_seconds / 1_000_000, 2)
-    out["download_bytes"] = got
+    out["download_mbps"] = round(got * 8 / down["measured_s"] / 1_000_000, 2)
+    out["download_bytes"] = down["total_bytes"]
 
     payload = b"0" * SPEED_UPLOAD_CHUNK_BYTES
 
@@ -411,16 +454,22 @@ def run_speed_test(download_s: float = SPEED_DOWNLOAD_SECONDS,
             resp.read()
         return len(payload)
 
-    sent, up_seconds, up_error = _timed_phase(upload_s, upload_once, parallel)
+    up = _timed_phase(upload_s, upload_once, parallel, warmup_s=warmup_s)
+    sent = up["counted_bytes"]
+    up_seconds = up["elapsed_s"]
     out["upload_seconds"] = round(up_seconds, 2)
-    if sent == 0 or up_seconds <= 0:
-        out["error"] = f"Upload test failed: {up_error}. Download result above still counts." \
-            if up_error else "Upload test sent no data. Download result above still counts."
+    out["upload_measured_seconds"] = round(up["measured_s"], 2)
+    out["cap_hit"] = bool(out.get("cap_hit") or up["cap_hit"])
+    if out["cap_hit"]:
+        out["note"] += " The safety data cap was hit, so a phase ended early."
+    if sent == 0 or up["measured_s"] <= 0:
+        out["error"] = f"Upload test failed: {up['error']}. Download result above still counts." \
+            if up["error"] else "Upload test sent no data. Download result above still counts."
         out["ok"] = True
-        out["data_used_bytes"] = got
+        out["data_used_bytes"] = down["total_bytes"]
         return out
-    out["upload_mbps"] = round(sent * 8 / up_seconds / 1_000_000, 2)
-    out["upload_bytes"] = sent
-    out["data_used_bytes"] = got + sent
+    out["upload_mbps"] = round(sent * 8 / up["measured_s"] / 1_000_000, 2)
+    out["upload_bytes"] = up["total_bytes"]
+    out["data_used_bytes"] = down["total_bytes"] + up["total_bytes"]
     out["ok"] = True
     return out

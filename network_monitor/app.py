@@ -12,6 +12,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import local_settings
 from .monitor import MonitorService
 from .prober import http_check, parse_url, run_speed_test
 from .web_ui import PAGE
@@ -87,6 +88,10 @@ def make_handler(token: str, service: MonitorService):
                 raw_range = (query.get("range") or [None])[0]
                 range_s = service_range(raw_range)
                 self._send(200, service.status(range_s=range_s))
+            elif path == "/api/expected-speeds":
+                if not self._allowed():
+                    return
+                self._send(200, {"expected": local_settings.load_expected_speeds()})
             elif path == "/api/export.csv":
                 if not self._allowed():
                     return
@@ -107,7 +112,8 @@ def make_handler(token: str, service: MonitorService):
         def do_POST(self):
             path = urlparse(self.path).path
             if path not in ("/api/target", "/api/http-check", "/api/speedtest",
-                            "/api/session/start", "/api/session/cancel"):
+                            "/api/session/start", "/api/session/cancel",
+                            "/api/expected-speeds"):
                 self._send(404, {"error": "Not found."})
                 return
             if not self._allowed():
@@ -127,7 +133,15 @@ def make_handler(token: str, service: MonitorService):
             if not isinstance(data, dict):
                 self._send(400, {"error": "Request must be a JSON object."})
                 return
-            if path == "/api/target":
+            if path == "/api/expected-speeds":
+                try:
+                    saved = local_settings.save_expected_speeds(
+                        data.get("download_mbps"), data.get("upload_mbps"))
+                except ValueError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                self._send(200, {"expected": saved})
+            elif path == "/api/target":
                 try:
                     parsed = parse_url(data.get("url", ""))
                 except ValueError as exc:
@@ -177,7 +191,7 @@ def make_handler(token: str, service: MonitorService):
                         if not isinstance(data[key], (int, float)) or isinstance(data[key], bool):
                             self._send(400, {"error": "Speed test durations must be numbers of seconds."})
                             return
-                        kwargs[key] = max(3.0, min(float(data[key]), 30.0))
+                        kwargs[key] = max(3.0, min(float(data[key]), 60.0))
                 if not _speed_lock.acquire(blocking=False):
                     self._send(409, {"error": "A speed test is already running. Wait for it to finish."})
                     return
@@ -185,6 +199,17 @@ def make_handler(token: str, service: MonitorService):
                     result = run_speed_test(**kwargs)
                 finally:
                     _speed_lock.release()
+                # Judge the fresh result against the locally saved plan
+                # speeds (never set = no verdict, never an error).
+                expected = local_settings.load_expected_speeds()
+                result["expected"] = expected
+                down = local_settings.assess_speed(
+                    result.get("download_mbps"), expected.get("download_mbps"))
+                up = local_settings.assess_speed(
+                    result.get("upload_mbps"), expected.get("upload_mbps"))
+                result["download_assessment"] = down
+                result["upload_assessment"] = up
+                result["overall_assessment"] = local_settings.overall_verdict([down, up])
                 self._send(200, {"result": result})
 
     return Handler

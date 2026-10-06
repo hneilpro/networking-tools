@@ -36,6 +36,18 @@ PAGE = r"""<!DOCTYPE html>
   pre { background: #8882; padding: .7rem; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
   .hidden { display: none; }
   #status { min-height: 1.4em; }
+  .badge { display: inline-block; padding: .2rem .7rem; border-radius: 999px; font-weight: 700; color: #fff; }
+  .badge.excellent { background: #1a7f37; } .badge.good { background: #5a9e2f; }
+  .badge.fair { background: #bf8700; } .badge.poor { background: #cf222e; }
+  .badge.unknown { background: #888; }
+  .gauge { margin: .9rem 0; }
+  .gauge-head { display: flex; justify-content: space-between; gap: .8rem; flex-wrap: wrap; }
+  .gauge-track { position: relative; height: 18px; border: 1px solid #8888; border-radius: 9px; background: #8882; margin: 1.4rem 0 .25rem; }
+  .gauge-fill { height: 100%; border-radius: 9px; max-width: 100%; }
+  .fill-excellent { background: #1a7f37; } .fill-good { background: #5a9e2f; }
+  .fill-fair { background: #bf8700; } .fill-poor { background: #cf222e; } .fill-unknown { background: #888; }
+  .gauge-marker { position: absolute; top: -4px; bottom: -4px; width: 2px; background: currentColor; }
+  .gauge-marker span { position: absolute; top: -1.25rem; right: -1.2rem; font-size: .72rem; white-space: nowrap; opacity: .85; }
 </style>
 </head>
 <body>
@@ -97,9 +109,23 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card">
   <h2>Speed test</h2>
-  <p>Sustained download (about 10 seconds) then upload (about 8 seconds), using several streams at once so the connection gets past its slow start. On a fast line this can use a few hundred MB. The live graph above will spike while it runs; that is the test, not an outage. It also grades bufferbloat: how much your latency rises while the line is saturated.</p>
+  <p>Sustained download (about 25 seconds) then upload (about 20 seconds), using several streams at once, with the first couple of seconds of slow-start ramp discarded from the headline numbers. Short bursts mostly measure the ramp, not your line; this runs long enough for the speed to settle. On a fast line this can use well over a gigabyte. The live graph above will spike while it runs; that is the test, not an outage. It also grades bufferbloat: how much your latency rises while the line is saturated.</p>
+  <h3>Your expected (plan) speeds</h3>
+  <p>What does your internet plan promise? These are saved on this PC only, in a local file that never leaves the machine, and the next speed test is graded against them.</p>
+  <div class="row">
+    <div>
+      <label for="expectedDownload">Expected download (Mbps)</label>
+      <input id="expectedDownload" type="number" min="0" step="any" placeholder="e.g. 500" autocomplete="off">
+    </div>
+    <div>
+      <label for="expectedUpload">Expected upload (Mbps)</label>
+      <input id="expectedUpload" type="number" min="0" step="any" placeholder="e.g. 50" autocomplete="off">
+    </div>
+  </div>
+  <button id="saveExpectedBtn" type="button">Save expected speeds</button>
+  <p id="expectedStatus" role="status"></p>
   <button id="speedBtn" type="button">Run speed test</button>
-  <p id="speedResult" role="status"></p>
+  <div id="speedResult" role="status"></div>
 </div>
 
 <p id="status" role="status"></p>
@@ -317,15 +343,78 @@ $("httpCheckBtn").addEventListener("click", async () => {
       `<span>Status: ${esc(r.status)}</span><span>Read: ${esc(r.bytes_read)} bytes</span><span>URL: ${esc(r.url)}</span></div>`;
   } catch (e) { $("httpResult").innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
 });
+let expectedSpeeds = { download_mbps: null, upload_mbps: null };
+
+function expectedHint() {
+  const d = expectedSpeeds.download_mbps, u = expectedSpeeds.upload_mbps;
+  if (d == null && u == null) return "No expected speeds saved yet. Add your plan speeds and save.";
+  const parts = [];
+  if (d != null) parts.push(`Download ${d} Mbps`);
+  if (u != null) parts.push(`Upload ${u} Mbps`);
+  return "Saved on this PC: " + parts.join(" · ") + ". The next speed test is graded against these.";
+}
+
+async function loadExpected() {
+  try {
+    expectedSpeeds = (await api("/api/expected-speeds")).expected || expectedSpeeds;
+    $("expectedDownload").value = expectedSpeeds.download_mbps == null ? "" : expectedSpeeds.download_mbps;
+    $("expectedUpload").value = expectedSpeeds.upload_mbps == null ? "" : expectedSpeeds.upload_mbps;
+    $("expectedStatus").textContent = expectedHint();
+  } catch (e) { $("expectedStatus").textContent = "Could not load saved expected speeds: " + e.message; }
+}
+loadExpected();
+
+$("saveExpectedBtn").addEventListener("click", async () => {
+  const parseField = id => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  const download = parseField("expectedDownload"), upload = parseField("expectedUpload");
+  if ((download !== null && !(download > 0)) || (upload !== null && !(upload > 0))) {
+    $("expectedStatus").textContent = "Expected speeds must be numbers above zero, or left blank to clear.";
+    return;
+  }
+  try {
+    expectedSpeeds = (await api("/api/expected-speeds", { download_mbps: download, upload_mbps: upload })).expected;
+    $("expectedStatus").textContent = "Saved. " + expectedHint();
+  } catch (e) { $("expectedStatus").textContent = e.message; }
+});
+
+function gaugeHtml(title, assessment, seconds) {
+  if (!assessment) return "";
+  const a = assessment;
+  const head = `<div class="gauge-head"><span>${esc(title)}: ${a.actual_mbps == null ? "failed" : `<strong>${esc(a.actual_mbps)} Mbps</strong>`}` +
+    (seconds != null ? ` <small>(${esc(seconds)}s)</small>` : "") + `</span>` +
+    `<span class="badge ${esc(a.verdict)}">${esc(a.label)}</span></div>`;
+  if (a.expected_mbps == null || a.pct_of_expected == null) {
+    return `<div class="gauge">${head}<small>${esc(a.explanation)}</small></div>`;
+  }
+  const scaleMax = 125; // headroom so beating the plan is visible too
+  const fillPct = Math.min(a.pct_of_expected, scaleMax) / scaleMax * 100;
+  const markerPct = 100 / scaleMax * 100;
+  return `<div class="gauge">${head}` +
+    `<div class="gauge-track"><div class="gauge-fill fill-${esc(a.verdict)}" style="width:${fillPct}%"></div>` +
+    `<div class="gauge-marker" style="left:${markerPct}%"><span>plan ${esc(a.expected_mbps)} Mbps</span></div></div>` +
+    `<small>${esc(a.pct_of_expected)}% of your expected ${esc(title.toLowerCase())} speed. ${esc(a.explanation)}</small></div>`;
+}
+
 $("speedBtn").addEventListener("click", async () => {
   $("speedBtn").disabled = true;
-  $("speedResult").textContent = "Running (about 20 seconds). The graph will spike; that is the test, not an outage.";
+  $("speedResult").innerHTML = "Running (about 45 seconds). The graph will spike; that is the test, not an outage.";
   try {
     const r = (await api("/api/speedtest", {})).result;
     if (!r.ok) { $("speedResult").textContent = r.error || "Speed test failed."; return; }
-    let html = `Download: <strong>${esc(r.download_mbps)} Mbps</strong> in ${esc(r.download_seconds)}s · ` +
-      `Upload: <strong>${r.upload_mbps == null ? "failed" : esc(r.upload_mbps) + " Mbps"}</strong> in ${esc(r.upload_seconds)}s<br>` +
-      `<small>Data used: ${esc(fmtMB(r.data_used_bytes))}. ${esc(r.note)}${r.error ? " " + esc(r.error) : ""}</small>`;
+    let html = "";
+    if (r.overall_assessment) {
+      html += `<p>Overall: <span class="badge ${esc(r.overall_assessment.verdict)}">${esc(r.overall_assessment.label)}</span> ` +
+        `<small>${esc(r.overall_assessment.explanation)}</small></p>`;
+    }
+    html += gaugeHtml("Download", r.download_assessment, r.download_seconds);
+    html += gaugeHtml("Upload", r.upload_assessment, r.upload_seconds);
+    if (!r.download_assessment && !r.upload_assessment) {
+      html += `Download: <strong>${esc(r.download_mbps)} Mbps</strong> · Upload: <strong>${r.upload_mbps == null ? "failed" : esc(r.upload_mbps) + " Mbps"}</strong><br>`;
+    }
+    html += `<small>Data used: ${esc(fmtMB(r.data_used_bytes))}. ${esc(r.note)}${r.error ? " " + esc(r.error) : ""}</small>`;
     if (r.bufferbloat_grade) {
       html += `<br>Bufferbloat grade: <strong>${esc(r.bufferbloat_grade)}</strong> ` +
         `(latency ${esc(r.idle_latency_ms)} ms idle → ${esc(r.loaded_latency_ms)} ms under load, +${esc(r.bufferbloat_ms)} ms)`;

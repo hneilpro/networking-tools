@@ -96,14 +96,23 @@ Timed sessions and optional checks:
   it as a continuously monitored target on the same graph, or run a
   one-shot connection breakdown — DNS time, TCP connect, TLS handshake,
   time to first byte, total time, and HTTP status.
-- **Run speed test**: a sustained download (about 10 seconds) and
-  upload (about 8 seconds) over several streams at once via
-  Cloudflare's public speed endpoints, so the connection gets past its
-  slow start. It also reports a **bufferbloat grade**: how much your
-  latency rises while the line is saturated, which is what makes calls
-  and games fall apart during someone else's download. On a fast line
-  the test can use a few hundred MB; the result shows how much data it
-  actually used.
+- **Run speed test**: a sustained download (about 25 seconds) and
+  upload (about 20 seconds) over several streams at once via
+  Cloudflare's public speed endpoints, with the first couple of
+  seconds of slow-start ramp discarded from the headline numbers —
+  short bursts mostly measure the ramp, not your line. It also reports
+  a **bufferbloat grade**: how much your latency rises while the line
+  is saturated, which is what makes calls and games fall apart during
+  someone else's download. On a fast line the test can use well over a
+  gigabyte; the result shows how much data it actually used.
+- **Expected speeds verdict**: enter the download/upload speeds your
+  internet plan promises and save them; every speed test after that is
+  graded against them with a bar graphic per direction — the measured
+  speed as a percentage of your plan (90%+ excellent, 75%+ good,
+  50%+ below expected, under 50% way below), with a marker at your
+  plan speed. Your expected speeds are personal and per-PC, so they
+  are stored as JSON in `network_monitor/local_data/` inside the app,
+  a folder that is excluded from git and never sent anywhere.
 - **Download CSV**: exports the whole monitoring history so you have a
   record of a dropout, e.g. for an ISP support call.
 
@@ -131,7 +140,8 @@ Limitations to know:
   are already broken. Timestamps in the CSV are exact.
 - The speed test uses several plain-HTTP streams for a fixed time, so
   very fast lines may still read low. Treat it as "is it roughly
-  right", not a benchmark record.
+  right", not a benchmark record. A 2 GB safety cap ends a phase early
+  on extremely fast lines; the result says so when that happens.
 - History lives in memory (about two hours of samples) plus the CSV
   export. Nothing is uploaded anywhere.
 
@@ -268,6 +278,8 @@ network_monitor/
     monitor.py                # continuous sampler, ring buffer, outage log
     prober.py                 # ping/TCP probes, HTTP breakdown, speed test
     metrics.py                # median/p95/jitter/loss stats + stability verdict
+    local_settings.py         # expected plan speeds, stored as local JSON
+    local_data/               # runtime-written settings JSON; git-ignored, never committed
 tests/                        # pytest suite (verdict logic, metrics, validation, HTTP layer)
 ```
 
