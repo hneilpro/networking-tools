@@ -109,7 +109,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card">
   <h2>Speed test</h2>
-  <p>Sustained download (about 25 seconds) then upload (about 20 seconds), using several streams at once, with the first couple of seconds of slow-start ramp discarded from the headline numbers. Short bursts mostly measure the ramp, not your line; this runs long enough for the speed to settle. On a fast line this can use well over a gigabyte. The live graph above will spike while it runs; that is the test, not an outage. It also grades bufferbloat: how much your latency rises while the line is saturated.</p>
+  <p>Sustained download (about 25 seconds) then upload (about 20 seconds), using several persistent streams at once, with the first couple of seconds of slow-start ramp discarded from the headline numbers. Short bursts mostly measure the ramp, not your line; this runs long enough for the speed to settle. On a fast line this can use well over a gigabyte. The live graph above will spike while it runs; that is the test, not an outage. It also grades bufferbloat: how much your latency rises while the line is saturated. If a phase cannot finish cleanly, the result is marked incomplete and is not graded against your plan.</p>
   <h3>Your expected (plan) speeds</h3>
   <p>What does your internet plan promise? These are saved on this PC only, in a local file that never leaves the machine, and the next speed test is graded against them.</p>
   <div class="row">
@@ -405,6 +405,11 @@ $("speedBtn").addEventListener("click", async () => {
     const r = (await api("/api/speedtest", {})).result;
     if (!r.ok) { $("speedResult").textContent = r.error || "Speed test failed."; return; }
     let html = "";
+    if (r.complete === false) {
+      html += `<p><span class="badge poor">Test incomplete</span> ` +
+        `<small>These numbers are provisional and were not graded against your plan. ` +
+        `Re-run the test before treating them as evidence.</small></p>`;
+    }
     if (r.overall_assessment) {
       html += `<p>Overall: <span class="badge ${esc(r.overall_assessment.verdict)}">${esc(r.overall_assessment.label)}</span> ` +
         `<small>${esc(r.overall_assessment.explanation)}</small></p>`;
@@ -415,6 +420,15 @@ $("speedBtn").addEventListener("click", async () => {
       html += `Download: <strong>${esc(r.download_mbps)} Mbps</strong> · Upload: <strong>${r.upload_mbps == null ? "failed" : esc(r.upload_mbps) + " Mbps"}</strong><br>`;
     }
     html += `<small>Data used: ${esc(fmtMB(r.data_used_bytes))}. ${esc(r.note)}${r.error ? " " + esc(r.error) : ""}</small>`;
+    const diag = [];
+    if (r.speed_colo) diag.push(`Cloudflare ${esc(r.speed_colo)}`);
+    if (r.download_requests != null) diag.push(`download ${esc(r.download_completed_requests)}/${esc(r.download_requests)} requests over ${esc(r.download_connections)} connection(s)`);
+    if (r.upload_requests != null) diag.push(`upload ${esc(r.upload_completed_requests)}/${esc(r.upload_requests)} requests over ${esc(r.upload_connections)} connection(s)`);
+    if (r.download_p90_mbps != null) diag.push(`download steady-peak ${esc(r.download_p90_mbps)} Mbps`);
+    if (r.upload_p90_mbps != null) diag.push(`upload steady-peak ${esc(r.upload_p90_mbps)} Mbps`);
+    const errs = [...(r.download_errors || []), ...(r.upload_errors || [])];
+    if (errs.length) diag.push(`errors: ${esc(errs.slice(0, 3).join("; "))}`);
+    if (diag.length) html += `<br><small>Test detail: ${diag.join(" · ")}</small>`;
     if (r.bufferbloat_grade) {
       html += `<br>Bufferbloat grade: <strong>${esc(r.bufferbloat_grade)}</strong> ` +
         `(latency ${esc(r.idle_latency_ms)} ms idle → ${esc(r.loaded_latency_ms)} ms under load, +${esc(r.bufferbloat_ms)} ms)`;

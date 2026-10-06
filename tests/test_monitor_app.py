@@ -195,3 +195,50 @@ def test_monitor_session_bad_duration(monitor_server):
     for bad in ({"duration_min": 0}, {"duration_min": 999}, {}, {"duration_min": "soon"}):
         status, _, _ = _call(srv, "POST", "/api/session/start", token=token, body=bad)
         assert status == 400, bad
+
+
+def test_monitor_speedtest_incomplete_result_is_not_graded(monitor_server, monkeypatch):
+    # A phase that ended early (the v3 failure: 9.41s of 25s, graded
+    # "way below expected") must come back labelled incomplete with no
+    # plan verdict, even though it carries provisional numbers.
+    from network_monitor import local_settings
+    monkeypatch.setattr(local_settings, "load_expected_speeds",
+                        lambda: {"download_mbps": 300.0, "upload_mbps": 100.0})
+
+    def fake_speed_test(**kwargs):
+        return {"ok": True, "download_mbps": 140.0, "upload_mbps": 21.0,
+                "download_reliable": False, "upload_reliable": False,
+                "reliable": False, "complete": False,
+                "error": "Test incomplete: download phase ended early."}
+
+    monkeypatch.setattr(monitor_app, "run_speed_test", fake_speed_test)
+    srv, token, _ = monitor_server
+    status, body, _ = _call(srv, "POST", "/api/speedtest", token=token, body={})
+    assert status == 200
+    result = json.loads(body)["result"]
+    assert result["overall_assessment"] is None
+    for key in ("download_assessment", "upload_assessment"):
+        assert result[key]["label"] == "Test incomplete"
+        assert result[key]["pct_of_expected"] is None
+        assert result[key]["verdict"] == "unknown"
+    # The provisional numbers are still shown, just never graded.
+    assert result["download_assessment"]["actual_mbps"] == 140.0
+
+
+def test_monitor_speedtest_reliable_result_is_graded(monitor_server, monkeypatch):
+    from network_monitor import local_settings
+    monkeypatch.setattr(local_settings, "load_expected_speeds",
+                        lambda: {"download_mbps": 300.0, "upload_mbps": 100.0})
+
+    def fake_speed_test(**kwargs):
+        return {"ok": True, "download_mbps": 290.0, "upload_mbps": 95.0,
+                "download_reliable": True, "upload_reliable": True,
+                "reliable": True, "complete": True}
+
+    monkeypatch.setattr(monitor_app, "run_speed_test", fake_speed_test)
+    srv, token, _ = monitor_server
+    status, body, _ = _call(srv, "POST", "/api/speedtest", token=token, body={})
+    assert status == 200
+    result = json.loads(body)["result"]
+    assert result["download_assessment"]["verdict"] == "excellent"
+    assert result["overall_assessment"]["verdict"] == "excellent"

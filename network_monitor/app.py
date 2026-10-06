@@ -203,13 +203,31 @@ def make_handler(token: str, service: MonitorService):
                 # speeds (never set = no verdict, never an error).
                 expected = local_settings.load_expected_speeds()
                 result["expected"] = expected
+                # An incomplete/unreliable direction is never graded
+                # against the plan: its number is provisional only.
                 down = local_settings.assess_speed(
-                    result.get("download_mbps"), expected.get("download_mbps"))
+                    result.get("download_mbps")
+                    if result.get("download_reliable", True) else None,
+                    expected.get("download_mbps"))
                 up = local_settings.assess_speed(
-                    result.get("upload_mbps"), expected.get("upload_mbps"))
+                    result.get("upload_mbps")
+                    if result.get("upload_reliable", True) else None,
+                    expected.get("upload_mbps"))
+                for assessment, key in ((down, "download"), (up, "upload")):
+                    if not result.get(f"{key}_reliable", True) \
+                            and result.get(f"{key}_mbps") is not None:
+                        assessment["actual_mbps"] = result[f"{key}_mbps"]
+                        assessment["pct_of_expected"] = None
+                        assessment["verdict"] = "unknown"
+                        assessment["label"] = "Test incomplete"
+                        assessment["explanation"] = (
+                            "This direction did not finish cleanly, so this "
+                            "number is provisional and not graded against your plan.")
                 result["download_assessment"] = down
                 result["upload_assessment"] = up
-                result["overall_assessment"] = local_settings.overall_verdict([down, up])
+                result["overall_assessment"] = (
+                    local_settings.overall_verdict([down, up])
+                    if result.get("reliable", True) else None)
                 self._send(200, {"result": result})
 
     return Handler

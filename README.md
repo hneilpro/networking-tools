@@ -97,10 +97,14 @@ Timed sessions and optional checks:
   one-shot connection breakdown — DNS time, TCP connect, TLS handshake,
   time to first byte, total time, and HTTP status.
 - **Run speed test**: a sustained download (about 25 seconds) and
-  upload (about 20 seconds) over several streams at once via
-  Cloudflare's public speed endpoints, with the first couple of
-  seconds of slow-start ramp discarded from the headline numbers —
-  short bursts mostly measure the ramp, not your line. It also reports
+  upload (about 20 seconds) over several persistent streams at once
+  via Cloudflare's public speed endpoints. Bytes are counted as they
+  move and the first couple of seconds of slow-start ramp are
+  discarded from the headline numbers — short bursts mostly measure
+  the ramp, not your line. Failed requests retry with smaller
+  transfers and are reported in the result; a phase that cannot
+  finish cleanly is marked incomplete and is not graded against your
+  plan. It also reports
   a **bufferbloat grade**: how much your latency rises while the line
   is saturated, which is what makes calls and games fall apart during
   someone else's download. On a fast line the test can use well over a
@@ -138,10 +142,11 @@ Limitations to know:
 - Sample cadence is about one second per target, but a failing target
   takes longer to time out, so the real interval stretches when things
   are already broken. Timestamps in the CSV are exact.
-- The speed test uses several plain-HTTP streams for a fixed time, so
-  very fast lines may still read low. Treat it as "is it roughly
-  right", not a benchmark record. A 2 GB safety cap ends a phase early
-  on extremely fast lines; the result says so when that happens.
+- The speed test measures to Cloudflare's nearest edge, not to a
+  server inside your ISP's network the way Speedtest.net does, so
+  expect it to land near — not exactly on — a Speedtest.net result
+  run at the same time. A 2 GB safety cap ends a phase early on
+  extremely fast lines; the result says so when that happens.
 - History lives in memory (about two hours of samples) plus the CSV
   export. Nothing is uploaded anywhere.
 
