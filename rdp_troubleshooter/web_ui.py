@@ -24,7 +24,12 @@ PAGE = r"""<!DOCTYPE html>
   code { background: #8882; padding: .1rem .3rem; border-radius: 4px; word-break: break-all; }
   pre { background: #8882; padding: .7rem; border-radius: 8px; overflow-x: auto; }
   pre code { background: none; padding: 0; }
-  .device { padding: .4rem .6rem; border: 1px solid #8884; border-radius: 8px; margin: .4rem 0; cursor: pointer; width: 100%; text-align: left; }
+  #devices { max-height: 300px; overflow-y: auto; border: 1px solid #8884; border-radius: 8px; padding: .3rem; }
+  .device { padding: .35rem .55rem; border: 0; border-bottom: 1px solid #8883; border-radius: 0; margin: 0; cursor: pointer; width: 100%; text-align: left; background: none; }
+  .device:last-child { border-bottom: 0; }
+  .device:hover { background: #8882; }
+  .checkline { display: flex; gap: .5rem; align-items: center; font-weight: 400; margin-top: .5rem; }
+  .checkline input { width: auto; }
   .tag { font-size: .78rem; border: 1px solid #8888; border-radius: 999px; padding: .05rem .5rem; margin-left: .4rem; }
   .hidden { display: none; }
   #status { min-height: 1.4em; }
@@ -39,7 +44,8 @@ PAGE = r"""<!DOCTYPE html>
   <p id="netinfo">Detecting your network&hellip;</p>
   <button id="scanBtn" type="button">Scan my network for devices</button>
   <p id="scanStatus"></p>
-  <div id="devices"></div>
+  <div id="devices" class="hidden"></div>
+  <label class="checkline hidden" id="pingOnlyWrap"><input type="checkbox" id="showPingOnly"> Show ping-only devices too (no name, no open ports: often just the router/VPN answering for empty addresses)</label>
   <label for="targetSelect">Found devices (likely Windows PCs first)</label>
   <select id="targetSelect"><option value="">Run a scan, or type the PC below</option></select>
   <label for="target">Target PC name or IP address</label>
@@ -108,22 +114,38 @@ api("/api/local-info").then(info => {
 
 $("targetSelect").addEventListener("change", () => { if ($("targetSelect").value) $("target").value = $("targetSelect").value; });
 
+let lastDevices = [];
+function renderDevices() {
+  const showAll = $("showPingOnly").checked;
+  const visible = lastDevices.filter(d => showAll || !d.ping_only);
+  $("devices").innerHTML = visible.map(d =>
+    `<button type="button" class="device" data-ip="${esc(d.ip)}"><strong>${esc(d.hostname || d.ip)}</strong> · ${esc(d.ip)}` +
+    `${d.mac ? " · " + esc(d.mac) : ""}${d.windows_likely ? '<span class="tag">likely Windows</span>' : ""}` +
+    `${d.rdp_ready ? '<span class="tag">RDP ready</span>' : ""}${d.is_this_pc ? '<span class="tag">this PC</span>' : ""}` +
+    ` <small>— ${d.open_ports.length ? "ports: " + d.open_ports.map(p => esc(p.port)).join(", ") : (d.ping_only ? "ping only" : "no open ports")}</small></button>`).join("") ||
+    '<p style="padding:.4rem">Nothing useful answered. Tick the box below to see every address that replied to ping.</p>';
+  $("devices").classList.toggle("hidden", lastDevices.length === 0);
+  document.querySelectorAll(".device").forEach(el => el.addEventListener("click", () => { $("target").value = el.dataset.ip; $("targetSelect").value = el.dataset.ip; }));
+}
+$("showPingOnly").addEventListener("change", renderDevices);
+
 $("scanBtn").addEventListener("click", async () => {
   $("scanBtn").disabled = true;
   $("scanStatus").textContent = "Scanning (up to about a minute)...";
   try {
     const data = await api("/api/scan", {});
-    const devices = data.devices || [];
-    devices.sort((a, b) => (b.windows_likely - a.windows_likely) || (b.rdp_ready - a.rdp_ready));
-    $("targetSelect").innerHTML = '<option value="">Pick a device</option>' + devices.map(d =>
-      `<option value="${esc(d.ip)}">${esc(d.hostname || d.ip)} (${esc(d.ip)})${d.windows_likely ? " - likely Windows" : ""}${d.rdp_ready ? " - RDP ready" : ""}${d.is_this_pc ? " - this PC" : ""}</option>`).join("");
-    $("devices").innerHTML = devices.map(d =>
-      `<button type="button" class="device" data-ip="${esc(d.ip)}"><strong>${esc(d.hostname || "Unknown name")}</strong> · ${esc(d.ip)}` +
-      `${d.mac ? " · " + esc(d.mac) : ""}${d.windows_likely ? '<span class="tag">likely Windows</span>' : ""}` +
-      `${d.rdp_ready ? '<span class="tag">RDP ready</span>' : ""}${d.is_this_pc ? '<span class="tag">this PC</span>' : ""}<br>` +
-      `<small>Open ports: ${d.open_ports.length ? d.open_ports.map(p => esc(p.port) + " (" + esc(p.name) + ")").join(", ") : "none found"}${d.ping ? " · answers ping" : ""}</small></button>`).join("");
-    document.querySelectorAll(".device").forEach(el => el.addEventListener("click", () => { $("target").value = el.dataset.ip; $("targetSelect").value = el.dataset.ip; }));
-    $("scanStatus").textContent = devices.length ? `Found ${devices.length} device(s). Click one to select it.` : "No devices answered. The PCs may be asleep, or the router may isolate devices from each other.";
+    lastDevices = data.devices || [];
+    lastDevices.sort((a, b) => (b.windows_likely - a.windows_likely) || (b.rdp_ready - a.rdp_ready) || (b.open_ports.length - a.open_ports.length));
+    // The dropdown keeps every device; the visible list hides ping-only noise by default.
+    $("targetSelect").innerHTML = '<option value="">Pick a device</option>' + lastDevices.map(d =>
+      `<option value="${esc(d.ip)}">${esc(d.hostname || d.ip)} (${esc(d.ip)})${d.windows_likely ? " - likely Windows" : ""}${d.rdp_ready ? " - RDP ready" : ""}${d.is_this_pc ? " - this PC" : ""}${d.ping_only ? " - ping only" : ""}</option>`).join("");
+    const useful = lastDevices.filter(d => !d.ping_only).length;
+    const pingOnly = lastDevices.length - useful;
+    $("pingOnlyWrap").classList.toggle("hidden", pingOnly === 0);
+    renderDevices();
+    $("scanStatus").textContent = lastDevices.length
+      ? `Found ${useful} identifiable device(s)${pingOnly ? ` (+${pingOnly} ping-only, hidden)` : ""}. Click one in the list, or pick from the dropdown.`
+      : "No devices answered. The PCs may be asleep, or the router may isolate devices from each other.";
   } catch (e) {
     $("scanStatus").textContent = e.message;
   } finally { $("scanBtn").disabled = false; }

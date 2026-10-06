@@ -79,6 +79,9 @@ def _probe_host(ip: str, arp: dict[str, str], local_ip: str | None) -> dict | No
         "windows_likely": windows_likely,
         "rdp_ready": results[RDP_PORT].state == "open",
         "is_this_pc": ip == local_ip,
+        # Only a ping reply, with no name/MAC/open port, is weak evidence:
+        # some routers/VPNs answer ping for every address. The UI hides these.
+        "ping_only": bool(ping_ok and not open_ports and not hostname),
     }
 
 
