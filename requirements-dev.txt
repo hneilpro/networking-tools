@@ -1,0 +1,3 @@
+# Only needed to run the test suite. The tools themselves use
+# nothing outside the Python standard library.
+pytest>=8.0
