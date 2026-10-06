@@ -187,9 +187,10 @@ function drawChart(targets, status) {
 
 function render(status) {
   lastStatus = status;
-  $("netinfo").textContent = status.local_ip
+  $("netinfo").textContent = (status.local_ip
     ? `This PC: ${status.local_ip} · Network: ${status.subnet} · Monitoring ${status.targets.length} target(s)`
-    : "Could not detect this PC's network address.";
+    : "Could not detect this PC's network address.")
+    + (status.network_note ? " " + status.network_note : "");
   $("legend").innerHTML = status.targets.map((t, i) =>
     `<span data-i="${i}" class="${hiddenTargets.has(i) ? "off" : ""}"><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span>${esc(t.name)}</span>`).join("");
   document.querySelectorAll("#legend span[data-i]").forEach(el =>
@@ -201,7 +202,7 @@ function render(status) {
   $("cards").innerHTML = status.targets.map(t => {
     const s = t.stats;
     return `<div class="tcard"><h3>${esc(t.name)}</h3>` +
-      `<p class="${verdictClass(t.verdict)}" style="margin:.1rem 0"><strong>${esc(t.verdict)}</strong> — ${esc(t.verdict_explanation)}</p>` +
+      `<p class="${verdictClass(t.verdict)}" style="margin:.1rem 0"><strong>${esc(String(t.verdict).replace(/_/g, " "))}</strong> — ${esc(t.verdict_explanation)}</p>` +
       `<div class="stats"><span>Now: ${fmt(s.last_ms, " ms")}</span><span>Median: ${fmt(s.median_ms, " ms")}</span>` +
       `<span>p95: ${fmt(s.p95_ms, " ms")}</span><span>p99: ${fmt(s.p99_ms, " ms")}</span>` +
       `<span>Min: ${fmt(s.min_ms, " ms")}</span><span>Worst spike: ${fmt(s.max_ms, " ms")}</span>` +

@@ -12,7 +12,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 from .diagnostics import WINDOWS_HINT_PORTS, RDP_PORT, ping_host, tcp_check
-from .network_utils import local_ipv4, subnet_for
+from .network_utils import default_gateway, is_wsl, local_ipv4, subnet_for
 
 SCAN_PORTS = (RDP_PORT, 445, 135, 139, 80, 443)
 PORT_NAMES = {3389: "RDP", 445: "SMB", 135: "MSRPC", 139: "NetBIOS", 80: "HTTP", 443: "HTTPS"}
@@ -51,11 +51,23 @@ def resolve_hostname(ip: str) -> str | None:
 
 def detect_network() -> dict:
     ip = local_ipv4()
-    info = {"local_ip": ip, "subnet": None, "gateway_hint": None}
+    gateway = default_gateway() if ip else None
+    gateway_source = "route" if gateway else None
+    if ip and not gateway:
+        # Routing-table lookup failed: '.1' is the usual home-router
+        # address, but it is a guess and is labelled as one downstream.
+        octets = ip.split(".")
+        gateway = ".".join(octets[:3] + ["1"])
+        gateway_source = "guess"
+    wsl = is_wsl()
+    info = {"local_ip": ip, "subnet": None, "gateway_hint": gateway,
+            "gateway_source": gateway_source,
+            "environment": "wsl" if wsl else "native",
+            # Under WSL the default gateway is the Windows host's virtual
+            # NAT interface, not the physical router on the LAN.
+            "gateway_is_virtual": bool(wsl and gateway)}
     if ip:
         info["subnet"] = str(subnet_for(ip, 24))
-        octets = ip.split(".")
-        info["gateway_hint"] = ".".join(octets[:3] + ["1"])
     return info
 
 

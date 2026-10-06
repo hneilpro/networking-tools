@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from rdp_troubleshooter.scanner import detect_network
 
 from .metrics import compute_stats, stability_verdict
-from .prober import ParsedUrl, probe_target
+from .prober import ParsedUrl, probe_gateway, probe_target
 
 MAX_SAMPLES = 7200  # ~2 hours at 1 sample/sec per target
 DEFAULT_RANGE_S = 300
@@ -52,6 +52,18 @@ def _fault_conclusion(target_reports: list[dict]) -> str:
     external = [t for t in target_reports if t["kind"] in ("internet", "custom")]
     gw_bad = any(bad(t) for t in gateway)
     ext_bad = any(bad(t) for t in external)
+    # A gateway that will not answer probes while traffic passes through
+    # it proves nothing about the LAN; judge the session on the targets
+    # that did answer.
+    if any(t["verdict"] == "probe_blocked" for t in gateway):
+        if ext_bad:
+            return ("Outside your home, most likely: the gateway would not answer "
+                    "probes (traffic still passes through it) while internet targets "
+                    "degraded. That points at the ISP / upstream link, not your LAN.")
+        return ("No LAN fault can be called from the gateway — it would not answer "
+                "probes, but internet targets stayed reachable through it the whole "
+                "session. For a true router reading, run the monitor natively on "
+                "Windows, not under WSL or a VM.")
     if gateway and ext_bad and not gw_bad:
         return ("Outside your home, most likely: the gateway/router stayed clean "
                 "while internet targets degraded. That points at the ISP / upstream link.")
@@ -68,9 +80,30 @@ def _fault_conclusion(target_reports: list[dict]) -> str:
     return "No fault seen in this session: every target stayed stable for the whole run."
 
 
+def _apply_gateway_probe_blocked(summaries: list[dict]) -> None:
+    """Downgrade a 'down' gateway when the internet is flowing through it.
+
+    If 1.1.1.1/8.8.8.8 are answering, the default gateway is forwarding
+    traffic by definition; a 100%-loss gateway line then means the
+    router (or a virtual NAT gateway, e.g. WSL's) refuses ping/TCP
+    probes, not that the LAN is down. Mutates the summary dicts."""
+    gateway = next((t for t in summaries if t["kind"] == "gateway"), None)
+    if gateway is None or gateway["verdict"] != "down":
+        return
+    external_ok = any(t["kind"] in ("internet", "custom")
+                      and t["stats"]["successes"] > 0 for t in summaries)
+    if external_ok:
+        gateway["verdict"] = "probe_blocked"
+        gateway["verdict_explanation"] = (
+            "Gateway isn't answering ping/TCP probes, but internet targets are "
+            "reachable through it, so traffic is passing. This is the router "
+            "(or a virtual gateway like WSL's) blocking probes, not a LAN outage.")
+
+
 class MonitorService:
     def __init__(self, probe_fn=probe_target, interval_s: float = 1.0):
         self._probe_fn = probe_fn
+        self._using_default_probe = probe_fn is probe_target
         self._interval_s = interval_s
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -85,6 +118,23 @@ class MonitorService:
             self._targets.append(Target(spec["name"], spec["host"], spec["tcp_port"], spec["kind"]))
         self.local_ip = info.get("local_ip")
         self.subnet = info.get("subnet")
+        self.gateway_source = info.get("gateway_source")
+        self.environment = info.get("environment")
+        self.gateway_is_virtual = bool(info.get("gateway_is_virtual"))
+
+    @property
+    def network_note(self) -> str | None:
+        """Context the live page shows next to the network line, or None."""
+        gateway = next((t.host for t in self._targets if t.kind == "gateway"), None)
+        if self.environment == "wsl":
+            return (f"Running under WSL: the gateway shown ({gateway}) is the Windows "
+                    "host's virtual NAT, not your physical router. For a true router "
+                    "reading, run this natively on Windows (py run_network_monitor.py), "
+                    "not inside WSL.")
+        if self.gateway_source == "guess" and gateway:
+            return (f"Gateway address {gateway} is a best guess (the usual .1) — the OS "
+                    "routing table could not be read this run, so treat its line with care.")
+        return None
 
     # --- lifecycle ---------------------------------------------------
     def start(self) -> None:
@@ -105,7 +155,10 @@ class MonitorService:
             for target in targets:
                 if self._stop.is_set():
                     break
-                result = self._probe_fn(target.host, target.tcp_port)
+                if target.kind == "gateway" and self._using_default_probe:
+                    result = probe_gateway(target.host)
+                else:
+                    result = self._probe_fn(target.host, target.tcp_port)
                 now = time.time()
                 with self._lock:
                     target.samples.append((now, result.ms if result.ok else None))
@@ -123,9 +176,26 @@ class MonitorService:
                     else:
                         target.consecutive_failures += 1
                         if target.consecutive_failures >= 3 and target.outage_started_at is None:
-                            target.outage_started_at = now
+                            # A gateway whose probes fail while internet
+                            # targets answered seconds ago is probe-blocked,
+                            # not out: never log it as an outage.
+                            if not (target.kind == "gateway"
+                                    and self._internet_recently_reachable_locked()):
+                                target.outage_started_at = now
             elapsed = time.monotonic() - cycle_start
             self._stop.wait(max(0.0, self._interval_s - elapsed))
+
+    def _internet_recently_reachable_locked(self) -> bool:
+        """Lock held. True when an internet/custom target answered within
+        the last 20s, which proves traffic is passing the gateway now."""
+        cutoff = time.time() - 20
+        for other in self._targets:
+            if other.kind not in ("internet", "custom") or not other.samples:
+                continue
+            ts, ms = other.samples[-1]
+            if ms is not None and ts >= cutoff:
+                return True
+        return False
 
     # --- targets -------------------------------------------------------
     def add_custom_target(self, parsed: ParsedUrl) -> dict:
@@ -211,6 +281,10 @@ class MonitorService:
             summary = self._target_summary(target, samples, consecutive_failures=0)
             summary.pop("series", None)
             target_reports.append(summary)
+        _apply_gateway_probe_blocked(target_reports)
+        gateway_probe_blocked = any(t["kind"] == "gateway"
+                                    and t["verdict"] == "probe_blocked"
+                                    for t in target_reports)
         outages = []
         for outage in self._outages:
             if outage["ended_at"] >= started and outage["started_at"] <= ended:
@@ -225,6 +299,9 @@ class MonitorService:
                     "duration_s": round(ended - target.outage_started_at, 1),
                     "ongoing": True,
                 })
+        if gateway_probe_blocked:
+            gateway_names = {t["name"] for t in target_reports if t["kind"] == "gateway"}
+            outages = [o for o in outages if o["target"] not in gateway_names]
         report = {
             "targets": target_reports,
             "outages": outages,
@@ -308,16 +385,30 @@ class MonitorService:
             for target in self._targets:
                 samples = [(ts, ms) for ts, ms in target.samples if since <= ts <= until]
                 targets.append(self._target_summary(target, samples))
+            _apply_gateway_probe_blocked(targets)
+            gateway_probe_blocked = any(t["kind"] == "gateway"
+                                        and t["verdict"] == "probe_blocked"
+                                        for t in targets)
+            gateway_names = {t["name"] for t in targets if t["kind"] == "gateway"}
+            outages = list(self._outages[-50:])
             active_outages = [{
                 "target": t.name, "host": t.host,
                 "started_at": t.outage_started_at, "ended_at": None,
             } for t in self._targets if t.outage_started_at is not None]
+            if gateway_probe_blocked:
+                outages = [o for o in outages if o["target"] not in gateway_names]
+                active_outages = [o for o in active_outages
+                                  if o["target"] not in gateway_names]
             session = self._session_snapshot_locked() if self._session else None
             return {
                 "local_ip": self.local_ip,
                 "subnet": self.subnet,
+                "gateway_source": self.gateway_source,
+                "environment": self.environment,
+                "gateway_is_virtual": self.gateway_is_virtual,
+                "network_note": self.network_note,
                 "targets": targets,
-                "outages": list(self._outages[-50:]),
+                "outages": outages,
                 "active_outages": active_outages,
                 "running": bool(self._thread and self._thread.is_alive()),
                 "range_s": range_s,

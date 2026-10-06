@@ -56,6 +56,30 @@ def test_probe_target_tcp_fallback(monkeypatch):
     assert result.ok and result.method == "tcp"
 
 
+def test_probe_gateway_uses_any_common_port(monkeypatch):
+    monkeypatch.setattr(prober, "ping_latency",
+                        lambda host, timeout_s=1.0: ProbeResult(False, None, "ping"))
+    tried = []
+
+    def fake_tcp(host, port, timeout_s=1.5):
+        tried.append(port)
+        return ProbeResult(port == 443, 7.0 if port == 443 else None, "tcp")
+
+    monkeypatch.setattr(prober, "tcp_latency", fake_tcp)
+    result = prober.probe_gateway("192.168.1.1")
+    assert result.ok and result.ms == 7.0
+    assert tried[:2] == [80, 443]  # stopped at the first port that answered
+
+
+def test_probe_gateway_all_ports_fail(monkeypatch):
+    monkeypatch.setattr(prober, "ping_latency",
+                        lambda host, timeout_s=1.0: ProbeResult(False, None, "ping"))
+    monkeypatch.setattr(prober, "tcp_latency",
+                        lambda host, port, timeout_s=1.5: ProbeResult(False, None, "tcp"))
+    result = prober.probe_gateway("172.25.214.1")
+    assert not result.ok and result.method == "none"
+
+
 def test_probe_target_both_fail(monkeypatch):
     monkeypatch.setattr(prober, "ping_latency",
                         lambda host, timeout_s=1.0: ProbeResult(False, None, "ping"))

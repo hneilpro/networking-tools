@@ -166,6 +166,32 @@ def probe_target(host: str, tcp_port: int, timeout_s: float = 1.0) -> ProbeResul
     return ProbeResult(False, None, "none", fallback.detail or result.detail)
 
 
+# Routers commonly listen on one of these even when they ignore ping and
+# keep their web UI off port 80 (or sit behind a virtual NAT, as in WSL).
+GATEWAY_TCP_PORTS = (80, 443, 53, 8080, 22)
+
+
+def probe_gateway(host: str, timeout_s: float = 1.0) -> ProbeResult:
+    """Probe a gateway/router: ping, then TCP on several common ports.
+
+    Consumer routers often drop ICMP and expose no web UI on the LAN
+    side, so a single-port fallback (the old behaviour) called healthy
+    gateways 'down'. One answered port is enough to prove reachability;
+    all of them failing still only proves the *probes* were refused —
+    the monitor cross-checks internet targets before calling an outage."""
+    result = ping_latency(host, timeout_s)
+    if result.ok:
+        return result
+    for port in GATEWAY_TCP_PORTS:
+        fallback = tcp_latency(host, port, timeout_s=0.75)
+        if fallback.ok:
+            fallback.detail = f"Ping blocked; measured by TCP connect on port {port} instead."
+            return fallback
+    return ProbeResult(False, None, "none",
+                       "Gateway answered neither ping nor TCP on ports "
+                       "80/443/53/8080/22. Its probes may be blocked.")
+
+
 def http_check(parsed: ParsedUrl, timeout_s: float = 10.0) -> dict:
     """One-shot connection breakdown: DNS, TCP, TLS, first byte, total."""
     out: dict = {"url": parsed.url, "host": parsed.host, "port": parsed.port,

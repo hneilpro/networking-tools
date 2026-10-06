@@ -70,7 +70,10 @@ watches it continuously and graphs what is actually happening:
   1–3% loss degrades calls and gaming badly.
 - Per-target **median, p95, and p99** ping (averages hide spikes),
   current / min / max, worst spike, and a plain-language verdict:
-  stable, degraded, unstable, or down.
+  stable, degraded, unstable, or down. A gateway that refuses probes
+  while internet traffic flows through it is reported as
+  **probe blocked** instead of down — that is the router (or a virtual
+  gateway) ignoring ping, not a LAN outage.
 - A **graph range selector** (1 min, 5 min, 15 min, 1 hour, All, or the
   current session): stats follow the range you are looking at, outages
   are shaded red on the graph, and clicking a target name in the legend
@@ -114,7 +117,15 @@ Limitations to know:
 
 - Ping uses your OS `ping` command; if a target blocks ping, the tool
   measures TCP connect time instead and says so. Blocked ping alone
-  never counts as "down".
+  never counts as "down". The gateway is probed on several common
+  ports (80/443/53/8080/22), and its address comes from your OS routing
+  table — the old ".1 guess" is only a labelled fallback.
+- **Run it natively, not under WSL or a VM, to measure your router.**
+  Inside WSL the default gateway is the Windows host's virtual NAT
+  (a 172.x.x.1 address), not your physical router; it often refuses
+  probes while forwarding traffic fine, and the page flags this.
+  The same applies to any virtualized network whose gateway is a
+  host-only NAT.
 - Sample cadence is about one second per target, but a failing target
   takes longer to time out, so the real interval stretches when things
   are already broken. Timestamps in the CSV are exact.

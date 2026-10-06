@@ -1,7 +1,10 @@
 import pytest
 
 from rdp_troubleshooter.network_utils import (
-    classify_ip, is_cgnat_ip, parse_port, parse_target, validate_scan_cidr,
+    classify_ip, is_cgnat_ip, parse_gateway_ip_route,
+    parse_gateway_mac_route_get, parse_gateway_netstat,
+    parse_gateway_proc_net_route, parse_gateway_windows_route_print,
+    parse_port, parse_target, validate_scan_cidr,
 )
 
 
@@ -39,6 +42,33 @@ def test_cgnat():
     assert is_cgnat_ip("100.127.255.254")
     assert not is_cgnat_ip("100.128.0.1")
     assert not is_cgnat_ip("192.168.1.1")
+
+
+def test_parse_gateway_windows_route_print():
+    text = (
+        "IPv4 Route Table\n"
+        "Active Routes:\n"
+        "Network Destination        Netmask          Gateway       Interface  Metric\n"
+        "          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.42     25\n"
+        "        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331\n"
+    )
+    assert parse_gateway_windows_route_print(text) == "192.168.1.1"
+    assert parse_gateway_windows_route_print("no routes here") is None
+
+
+def test_parse_gateway_linux_and_mac_outputs():
+    assert parse_gateway_ip_route(
+        "default via 172.25.214.1 dev eth0 proto dhcp metric 100\n") == "172.25.214.1"
+    assert parse_gateway_ip_route("10.0.0.0/24 dev eth0\n") is None
+    # /proc/net/route: gateway hex is little-endian (0101A8C0 = 192.168.1.1).
+    proc = ("Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+            "eth0 00000000 0101A8C0 0003 0 0 100 00000000 0 0 0\n")
+    assert parse_gateway_proc_net_route(proc) == "192.168.1.1"
+    assert parse_gateway_mac_route_get(
+        "   route to: default\n    gateway: 192.168.1.254\n") == "192.168.1.254"
+    assert parse_gateway_netstat(
+        "0.0.0.0            192.168.1.1        0.0.0.0            UG\n") == "192.168.1.1"
+    assert parse_gateway_netstat("") is None
 
 
 def test_validate_scan_cidr_private_only_and_size_capped():
