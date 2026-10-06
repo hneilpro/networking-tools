@@ -24,6 +24,8 @@ def test_stats_mixed():
     assert s.samples == 4 and s.successes == 3
     assert s.loss_pct == 25.0
     assert s.min_ms == 10.0 and s.max_ms == 30.0 and s.median_ms == 20.0
+    assert s.p95_ms == 30.0 and s.p99_ms == 30.0
+    assert s.to_dict()["p99_ms"] == 30.0
     assert s.last_ms == 30.0
     # jitter over successes in order: |20-10|, |30-20| -> 10
     assert s.jitter_ms == 10.0

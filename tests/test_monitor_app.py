@@ -138,3 +138,39 @@ def test_hub_unknown_tool_404(hub_server):
     srv, token, _ = hub_server
     status, _, _ = _call(srv, "GET", f"/launch/nope?token={token}", token=None)
     assert status == 404
+
+
+def test_monitor_status_range_param(monitor_server):
+    srv, token, _ = monitor_server
+    status, body, _ = _call(srv, "GET", "/api/status?range=60", token=token)
+    assert status == 200
+    assert json.loads(body)["range_s"] == 60
+    status, body, _ = _call(srv, "GET", "/api/status?range=session", token=token)
+    assert status == 200  # no session yet: falls back instead of erroring
+
+
+def test_monitor_session_flow(monitor_server):
+    srv, token, _ = monitor_server
+    status, body, _ = _call(srv, "POST", "/api/session/start", token=token,
+                            body={"duration_min": 1})
+    assert status == 200
+    assert json.loads(body)["session"]["state"] == "running"
+    status, _, _ = _call(srv, "POST", "/api/session/start", token=token,
+                         body={"duration_min": 1})
+    assert status == 409  # already running
+    status, body, headers = _call(srv, "GET", "/api/report.txt", token=token)
+    assert status == 200
+    assert b"Network Stability Session Report" in body
+    status, body, _ = _call(srv, "GET", "/api/export.csv?session=1", token=token)
+    assert status == 200
+    assert body.startswith(b"target,host,timestamp_iso,latency_ms,ok")
+    status, body, _ = _call(srv, "POST", "/api/session/cancel", token=token, body={})
+    assert status == 200
+    assert json.loads(body)["session"]["state"] == "cancelled"
+
+
+def test_monitor_session_bad_duration(monitor_server):
+    srv, token, _ = monitor_server
+    for bad in ({"duration_min": 0}, {"duration_min": 999}, {}, {"duration_min": "soon"}):
+        status, _, _ = _call(srv, "POST", "/api/session/start", token=token, body=bad)
+        assert status == 400, bad

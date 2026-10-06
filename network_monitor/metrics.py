@@ -33,6 +33,7 @@ class Stats:
     min_ms: float | None = None
     median_ms: float | None = None
     p95_ms: float | None = None
+    p99_ms: float | None = None
     max_ms: float | None = None
     jitter_ms: float | None = None
 
@@ -45,6 +46,7 @@ class Stats:
             "min_ms": _round(self.min_ms),
             "median_ms": _round(self.median_ms),
             "p95_ms": _round(self.p95_ms),
+            "p99_ms": _round(self.p99_ms),
             "max_ms": _round(self.max_ms),
             "jitter_ms": _round(self.jitter_ms),
         }
@@ -67,6 +69,7 @@ def compute_stats(samples: list[tuple[float, float | None]]) -> Stats:
         stats.max_ms = max(good)
         stats.median_ms = median(good)
         stats.p95_ms = percentile(good, 95)
+        stats.p99_ms = percentile(good, 99)
     # Jitter: mean absolute difference between consecutive successful samples,
     # skipping over losses (a loss is already counted in loss_pct).
     diffs = [abs(b - a) for a, b in zip(good, good[1:])]

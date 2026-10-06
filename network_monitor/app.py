@@ -20,6 +20,21 @@ MAX_BODY = 16_384
 _speed_lock = threading.Lock()
 
 
+def service_range(raw: str | None):
+    """Map the ?range= query value to a MonitorService range: seconds
+    back from now, "all", or "session". Anything odd falls back to the
+    5-minute default rather than erroring the whole status poll."""
+    if raw is None or raw == "":
+        return 300
+    if raw in ("all", "session"):
+        return raw
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return 300
+    return max(30.0, min(seconds, 7200.0))
+
+
 def make_handler(token: str, service: MonitorService):
     class Handler(BaseHTTPRequestHandler):
         server_version = "NetworkMonitor/1.0"
@@ -59,7 +74,9 @@ def make_handler(token: str, service: MonitorService):
             pass
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            parsed_path = urlparse(self.path)
+            path = parsed_path.path
+            query = parse_qs(parsed_path.query)
             if path == "/":
                 if not self._allowed():
                     return
@@ -67,17 +84,30 @@ def make_handler(token: str, service: MonitorService):
             elif path == "/api/status":
                 if not self._allowed():
                     return
-                self._send(200, service.status())
+                raw_range = (query.get("range") or [None])[0]
+                range_s = service_range(raw_range)
+                self._send(200, service.status(range_s=range_s))
             elif path == "/api/export.csv":
                 if not self._allowed():
                     return
-                self._send(200, service.export_csv(), "text/csv; charset=utf-8")
+                session_only = (query.get("session") or [""])[0] == "1"
+                self._send(200, service.export_csv(session_only=session_only),
+                           "text/csv; charset=utf-8")
+            elif path == "/api/report.txt":
+                if not self._allowed():
+                    return
+                text = service.session_report_text()
+                if text is None:
+                    self._send(404, {"error": "No session yet. Start a timed stability session first."})
+                    return
+                self._send(200, text, "text/plain; charset=utf-8")
             else:
                 self._send(404, {"error": "Not found."})
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path not in ("/api/target", "/api/http-check", "/api/speedtest"):
+            if path not in ("/api/target", "/api/http-check", "/api/speedtest",
+                            "/api/session/start", "/api/session/cancel"):
                 self._send(404, {"error": "Not found."})
                 return
             if not self._allowed():
@@ -111,12 +141,48 @@ def make_handler(token: str, service: MonitorService):
                     self._send(400, {"error": str(exc)})
                     return
                 self._send(200, {"result": http_check(parsed)})
+            elif path == "/api/session/start":
+                duration_min = data.get("duration_min")
+                duration_s = data.get("duration_s")
+                try:
+                    if duration_min is not None:
+                        seconds = float(duration_min) * 60
+                    elif duration_s is not None:
+                        seconds = float(duration_s)
+                    else:
+                        raise ValueError("Pick a session length first.")
+                except (TypeError, ValueError):
+                    self._send(400, {"error": "Session length must be a number of minutes."})
+                    return
+                if not 60 <= seconds <= 240 * 60:
+                    self._send(400, {"error": "Session length must be between 1 minute and 4 hours."})
+                    return
+                try:
+                    snapshot = service.start_session(seconds)
+                except RuntimeError as exc:
+                    self._send(409, {"error": str(exc)})
+                    return
+                self._send(200, {"session": snapshot})
+            elif path == "/api/session/cancel":
+                try:
+                    snapshot = service.cancel_session()
+                except RuntimeError as exc:
+                    self._send(409, {"error": str(exc)})
+                    return
+                self._send(200, {"session": snapshot})
             else:  # /api/speedtest
+                kwargs = {}
+                for key in ("download_s", "upload_s"):
+                    if key in data:
+                        if not isinstance(data[key], (int, float)) or isinstance(data[key], bool):
+                            self._send(400, {"error": "Speed test durations must be numbers of seconds."})
+                            return
+                        kwargs[key] = max(3.0, min(float(data[key]), 30.0))
                 if not _speed_lock.acquire(blocking=False):
                     self._send(409, {"error": "A speed test is already running. Wait for it to finish."})
                     return
                 try:
-                    result = run_speed_test()
+                    result = run_speed_test(**kwargs)
                 finally:
                     _speed_lock.release()
                 self._send(200, {"result": result})

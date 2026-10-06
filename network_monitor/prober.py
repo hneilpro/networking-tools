@@ -10,7 +10,9 @@ import platform
 import re
 import socket
 import ssl
+import statistics
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -21,9 +23,13 @@ from rdp_troubleshooter.network_utils import parse_target
 
 _PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 MAX_URL_LEN = 2048
-SPEED_DOWNLOAD_BYTES = 5_000_000
-SPEED_UPLOAD_BYTES = 1_000_000
-SPEED_MAX_BYTES = 25_000_000
+SPEED_DOWNLOAD_SECONDS = 10.0
+SPEED_UPLOAD_SECONDS = 8.0
+SPEED_DOWNLOAD_CHUNK_BYTES = 10_000_000
+SPEED_UPLOAD_CHUNK_BYTES = 262_144  # small chunks: a timed phase can only
+# overshoot its deadline by one in-flight chunk per stream
+SPEED_MAX_TOTAL_BYTES = 600_000_000  # safety cap across one whole test
+SPEED_PARALLEL_STREAMS = 4
 USER_AGENT = "networking-tools-monitor/1.0"
 
 
@@ -236,51 +242,159 @@ def _ms(since: float) -> float:
     return round((time.monotonic() - since) * 1000, 2)
 
 
-def run_speed_test(download_bytes: int = SPEED_DOWNLOAD_BYTES,
-                   upload_bytes: int = SPEED_UPLOAD_BYTES) -> dict:
-    """On-demand throughput via Cloudflare's public speed endpoints.
-    Single-threaded stdlib HTTP: a rough check, not a gigabit benchmark.
-    Sits outside the monitor loop on purpose — it saturates the link."""
-    download_bytes = min(max(100_000, download_bytes), SPEED_MAX_BYTES)
-    upload_bytes = min(max(10_000, upload_bytes), SPEED_MAX_BYTES)
-    out: dict = {"ok": False, "note": "Single-connection test. Fast lines may read low; "
-                                      "latency graphs will spike while this runs."}
-    url = f"https://speed.cloudflare.com/__down?bytes={download_bytes}"
+def bufferbloat_grade(delta_ms: float | None) -> str | None:
+    """Grade the latency increase under load. Bands follow the common
+    bufferbloat grading used by public tests: a few ms is invisible,
+    hundreds means calls and games fall apart while the line is busy."""
+    if delta_ms is None:
+        return None
+    if delta_ms <= 5:
+        return "A+"
+    if delta_ms <= 15:
+        return "A"
+    if delta_ms <= 30:
+        return "B"
+    if delta_ms <= 60:
+        return "C"
+    if delta_ms <= 120:
+        return "D"
+    return "F"
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    return round(statistics.median(values), 2) if values else None
+
+
+def _timed_phase(duration_s: float, do_once, parallel: int) -> tuple[int, float, str | None]:
+    """Run do_once(deadline) in `parallel` workers until the deadline.
+    Returns (total_bytes, elapsed_s, first_error). A single shared byte
+    cap keeps a fast line from turning the test into a data binge."""
     start = time.monotonic()
-    got = 0
-    try:
+    deadline = start + duration_s
+    state = {"total": 0}
+    lock = threading.Lock()
+    errors: list[str] = []
+
+    def worker() -> None:
+        while time.monotonic() < deadline:
+            with lock:
+                if state["total"] >= SPEED_MAX_TOTAL_BYTES:
+                    return
+            try:
+                n = do_once(deadline)
+            except (urllib.error.URLError, OSError) as exc:
+                with lock:
+                    if not errors:
+                        errors.append(str(exc))
+                return
+            if not n:
+                return
+            with lock:
+                state["total"] += n
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(max(1, parallel))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=duration_s + 20)
+    return state["total"], time.monotonic() - start, (errors[0] if errors else None)
+
+
+def run_speed_test(download_s: float = SPEED_DOWNLOAD_SECONDS,
+                   upload_s: float = SPEED_UPLOAD_SECONDS,
+                   parallel: int = SPEED_PARALLEL_STREAMS,
+                   probe_fn=None, urlopen_fn=None) -> dict:
+    """Sustained, time-boxed throughput via Cloudflare's public speed
+    endpoints. Timed phases (default ~10s down, ~8s up) instead of one
+    small fixed-size burst, so the connection gets past its slow start
+    and the number reflects the line, not the ramp. While the download
+    saturates the link, latency probes keep running so the result also
+    carries a bufferbloat (latency-under-load) grade. Sits outside the
+    monitor loop on purpose. probe_fn/urlopen_fn are injectable for tests."""
+    probe_fn = probe_fn or probe_target
+    urlopen_fn = urlopen_fn or urllib.request.urlopen
+    download_s = max(0.05, min(float(download_s), 60.0))
+    upload_s = max(0.05, min(float(upload_s), 60.0))
+    out: dict = {"ok": False,
+                 "note": "Sustained multi-stream test. Still an estimate on very fast "
+                         "lines; latency graphs will spike while this runs, which is "
+                         "the test, not an outage."}
+
+    idle_values: list[float] = []
+    for _ in range(3):
+        result = probe_fn("1.1.1.1", 443)
+        if result.ok and result.ms is not None:
+            idle_values.append(result.ms)
+    out["idle_latency_ms"] = _median_or_none(idle_values)
+
+    loaded_values: list[float] = []
+    loaded_stop = threading.Event()
+
+    def loaded_prober() -> None:
+        while not loaded_stop.is_set():
+            result = probe_fn("1.1.1.1", 443)
+            if result.ok and result.ms is not None:
+                loaded_values.append(result.ms)
+            loaded_stop.wait(0.1)
+
+    def download_once(deadline: float) -> int:
+        url = f"https://speed.cloudflare.com/__down?bytes={SPEED_DOWNLOAD_CHUNK_BYTES}"
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            while True:
+        n = 0
+        timeout = max(2.0, min(20.0, deadline - time.monotonic() + 1.0))
+        with urlopen_fn(req, timeout=timeout) as resp:
+            while time.monotonic() < deadline:
                 chunk = resp.read(65_536)
                 if not chunk:
                     break
-                got += len(chunk)
-    except (urllib.error.URLError, OSError) as exc:
-        out["error"] = f"Download test failed: {exc}."
+                n += len(chunk)
+        return n
+
+    prober_thread = threading.Thread(target=loaded_prober, daemon=True)
+    prober_thread.start()
+    try:
+        got, down_seconds, down_error = _timed_phase(download_s, download_once, parallel)
+    finally:
+        loaded_stop.set()
+        prober_thread.join(timeout=5)
+    out["download_seconds"] = round(down_seconds, 2)
+    out["loaded_latency_ms"] = _median_or_none(loaded_values)
+    if out["idle_latency_ms"] is not None and out["loaded_latency_ms"] is not None:
+        out["bufferbloat_ms"] = round(out["loaded_latency_ms"] - out["idle_latency_ms"], 2)
+    else:
+        out["bufferbloat_ms"] = None
+    out["bufferbloat_grade"] = bufferbloat_grade(out["bufferbloat_ms"])
+    if got == 0 or down_seconds <= 0:
+        out["error"] = f"Download test failed: {down_error}." if down_error \
+            else "Download test got no data."
         return out
-    seconds = time.monotonic() - start
-    if seconds <= 0 or got == 0:
-        out["error"] = "Download test got no data."
-        return out
-    out["download_mbps"] = round(got * 8 / seconds / 1_000_000, 2)
+    out["download_mbps"] = round(got * 8 / down_seconds / 1_000_000, 2)
     out["download_bytes"] = got
 
-    payload = b"0" * upload_bytes
-    start = time.monotonic()
-    try:
+    payload = b"0" * SPEED_UPLOAD_CHUNK_BYTES
+
+    def upload_once(deadline: float) -> int:
+        if time.monotonic() >= deadline:
+            return 0
         req = urllib.request.Request("https://speed.cloudflare.com/__up", data=payload,
                                      headers={"User-Agent": USER_AGENT,
                                               "Content-Type": "application/octet-stream"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        timeout = max(2.0, min(20.0, deadline - time.monotonic() + 1.0))
+        with urlopen_fn(req, timeout=timeout) as resp:
             resp.read()
-    except (urllib.error.URLError, OSError) as exc:
-        out["error"] = f"Upload test failed: {exc}. Download result above still counts."
+        return len(payload)
+
+    sent, up_seconds, up_error = _timed_phase(upload_s, upload_once, parallel)
+    out["upload_seconds"] = round(up_seconds, 2)
+    if sent == 0 or up_seconds <= 0:
+        out["error"] = f"Upload test failed: {up_error}. Download result above still counts." \
+            if up_error else "Upload test sent no data. Download result above still counts."
         out["ok"] = True
+        out["data_used_bytes"] = got
         return out
-    seconds = time.monotonic() - start
-    if seconds > 0:
-        out["upload_mbps"] = round(upload_bytes * 8 / seconds / 1_000_000, 2)
-        out["upload_bytes"] = upload_bytes
+    out["upload_mbps"] = round(sent * 8 / up_seconds / 1_000_000, 2)
+    out["upload_bytes"] = sent
+    out["data_used_bytes"] = got + sent
     out["ok"] = True
     return out

@@ -1,8 +1,11 @@
-"""URL validation, ping-output parsing, probe fallback, HTTP check."""
+"""URL validation, ping-output parsing, probe fallback, HTTP check, speed test."""
+import threading
+
 import pytest
 
 from network_monitor import prober
-from network_monitor.prober import ProbeResult, parse_ping_ms, parse_url
+from network_monitor.prober import (ProbeResult, bufferbloat_grade, parse_ping_ms,
+                                    parse_url, run_speed_test)
 
 
 def test_parse_ping_windows_and_linux():
@@ -67,3 +70,58 @@ def test_http_check_bad_dns():
     result = prober.http_check(parsed, timeout_s=3.0)
     assert result["ok"] is False
     assert "error" in result
+
+
+def test_bufferbloat_grades():
+    assert bufferbloat_grade(None) is None
+    assert bufferbloat_grade(3) == "A+"
+    assert bufferbloat_grade(10) == "A"
+    assert bufferbloat_grade(25) == "B"
+    assert bufferbloat_grade(50) == "C"
+    assert bufferbloat_grade(100) == "D"
+    assert bufferbloat_grade(300) == "F"
+
+
+class _FakeResp:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def read(self, n=-1):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_speed_test_timed_with_fakes():
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def fake_probe(host, port):
+        with lock:
+            calls["n"] += 1
+            n = calls["n"]
+        # First three probes are the idle baseline; the loaded probes
+        # during the download read higher.
+        return ProbeResult(True, 10.0 if n <= 3 else 30.0, "ping")
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url
+        if "__down" in url:
+            return _FakeResp([b"x" * 4096])
+        return _FakeResp([b""])
+
+    result = run_speed_test(download_s=0.25, upload_s=0.25, parallel=2,
+                            probe_fn=fake_probe, urlopen_fn=fake_urlopen)
+    assert result["ok"] is True
+    assert result["download_bytes"] > 0 and result["download_mbps"] > 0
+    assert result["upload_bytes"] > 0 and result["upload_mbps"] > 0
+    assert result["download_seconds"] >= 0.2
+    assert result["data_used_bytes"] == result["download_bytes"] + result["upload_bytes"]
+    assert result["idle_latency_ms"] == 10.0
+    assert result["loaded_latency_ms"] == 30.0
+    assert result["bufferbloat_ms"] == 20.0
+    assert result["bufferbloat_grade"] == "B"

@@ -68,24 +68,40 @@ watches it continuously and graphs what is actually happening:
   games feel broken.
 - **Packet loss** — the share of probes that never came back. Even
   1–3% loss degrades calls and gaming badly.
-- Per-target **median and p95** ping (averages hide spikes), current /
-  min / max, and a plain-language verdict: stable, degraded, unstable,
-  or down.
+- Per-target **median, p95, and p99** ping (averages hide spikes),
+  current / min / max, worst spike, and a plain-language verdict:
+  stable, degraded, unstable, or down.
+- A **graph range selector** (1 min, 5 min, 15 min, 1 hour, All, or the
+  current session): stats follow the range you are looking at, outages
+  are shaded red on the graph, and clicking a target name in the legend
+  hides or shows its line.
 - An **outage log**: when a target failed three probes in a row, when
   it came back, and how long it was out.
 - **Router vs internet separation**: if the gateway line stays clean
   while the internet lines spike, the fault is outside your home.
 
-Optional checks:
+Timed sessions and optional checks:
 
+- **Timed stability session**: run the live monitor for 1 minute,
+  5 minutes, 1 hour, or a custom length (1–240 minutes), with a
+  progress bar and a live report covering only that stretch. When it
+  ends you get per-target verdicts, every outage with times, and a
+  plain conclusion — inside your home or outside it — that you can
+  copy, download as a report, or export as session CSV. That is the
+  evidence to hand your ISP.
 - **Test a specific site or URL**: paste a URL (or host) and either add
   it as a continuously monitored target on the same graph, or run a
   one-shot connection breakdown — DNS time, TCP connect, TLS handshake,
   time to first byte, total time, and HTTP status.
-- **Run speed test**: on-demand download/upload (via Cloudflare's public
-  speed endpoints). It saturates your link for a few seconds, so the
-  live graph spikes while it runs — that is the test, not an outage.
-- **Download CSV**: exports the whole session history so you have a
+- **Run speed test**: a sustained download (about 10 seconds) and
+  upload (about 8 seconds) over several streams at once via
+  Cloudflare's public speed endpoints, so the connection gets past its
+  slow start. It also reports a **bufferbloat grade**: how much your
+  latency rises while the line is saturated, which is what makes calls
+  and games fall apart during someone else's download. On a fast line
+  the test can use a few hundred MB; the result shows how much data it
+  actually used.
+- **Download CSV**: exports the whole monitoring history so you have a
   record of a dropout, e.g. for an ISP support call.
 
 Run it:
@@ -102,10 +118,10 @@ Limitations to know:
 - Sample cadence is about one second per target, but a failing target
   takes longer to time out, so the real interval stretches when things
   are already broken. Timestamps in the CSV are exact.
-- The speed test is a single connection over plain HTTP, so very fast
-  lines may read low. Treat it as "is it roughly right", not a
-  benchmark record.
-- History lives in memory (about an hour of samples) plus the CSV
+- The speed test uses several plain-HTTP streams for a fixed time, so
+  very fast lines may still read low. Treat it as "is it roughly
+  right", not a benchmark record.
+- History lives in memory (about two hours of samples) plus the CSV
   export. Nothing is uploaded anywhere.
 
 ## Setup (one time)
